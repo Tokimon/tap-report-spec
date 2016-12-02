@@ -1,157 +1,80 @@
 'use strict';
 
-const tapOut = require('tap-parser');
-const through = require('through2');
-const duplexer = require('duplexer');
-const format = require('chalk');
-const _ = require('lodash');
-const symbols = require('figures');
+const nPath = require('path');
+const spawn = require('child_process').spawn;
+const yargs = require('yargs');
+const stream = require('stream');
+const duplexer = require('duplexer2');
 
-module.exports = function(spec) {
-  spec = spec || {};
+yargs
+  .option('test', {
+    alias: 't',
+    type: 'array',
+    describe: 'Which test to run (name without extension)',
+    default: '*'
+  })
+  .option('runner', {
+    alias: 'r',
+    type: 'string',
+    describe: 'Which test runner to use',
+    choices: ['tape', 'tap'],
+    default: 'tap'
+  })
+  .option('detail', {
+    alias: 'd',
+    type: 'array',
+    describe: `What to show in the report (can be combined)
+0: hide error details
+1: hide validated tests
+2: hide asserts
+3: hide child reports
+4: hide comments
+5: hide test names
+6: hide summary error reports`,
+    default: 6
+    // choices: [0, 1, 2, 3, 5, 6]
+  })
+  .help()
+  .alias('help', 'h');
 
-  const OUTPUT_PADDING = spec.padding || '  ';
+const args = yargs.argv;
 
-  const output = through();
-  const parser = tapOut();
-  const stream = duplexer(parser, output);
-  const startTime = process.hrtime();
+const parser = require(`./lib/${args.runner}-test-parser`);
 
-  const errorSummary = {};
-  let currTest = '';
+let failed = false;
 
-  output.push('\n');
+const levels = [1, 2, 4, 8, 16, 32, 64];
 
-  parser.on('comment', function(comment) {
-    comment = comment.replace(/^#\s+|[\n\s]+$/g, '');
-    if(/^(tests|pass|fail)/.test(comment)) { return; }
-    output.push('\n' + pad(format.underline(comment)) + '\n\n');
+const detailLevel = args.detail
+  .filter((val) => !(isNaN(val) || val < 0 || val > levels.length))
+  .reduce((a, b) => a + levels[b], 0);
 
-    currTest = comment;
-    errorSummary[currTest] = [];
-  });
 
-  parser.on('assert', function(assertion) {
-    if(assertion.skip || assertion.todo) { return; }
 
-    const name = assertion.name;
+const out = stream.PassThrough();
+const tapper = parser(detailLevel, (output) => out.push(output), () => { failed = true; });
 
-    if(assertion.ok) {
-      // Passing assertions
-      const glyph = format.green(symbols.tick);
 
-      output.push(pad('  ' + glyph + ' ' + format.dim(name) + '\n'));
-    } else {
-      // Failing assertions
-      const glyph = symbols.cross;
-      const title = glyph + ' ' + name;
-      const raw = format.cyan(prettifyError(assertion.diag));
-      const divider = _.fill(
-        new Array((title).length + 1),
-        '-'
-      ).join('');
 
-      errorSummary[currTest].push(name);
+let files = args.test;
+if(!files.length) { files = ['*']; }
 
-      output.push('\n' + pad('  ' + format.red(title) + '\n'));
-      output.push(pad('  ' + format.red(divider) + '\n'));
-      output.push(raw);
+files = files.length > 1 ? `@(${files.join('|')})` : files[0];
 
-      markFailed();
-    }
-  });
+const loader = spawn('node', ['./lib/test-loader.js', nPath.resolve(`test/${files}.js`), args.runner]);
 
-  parser.on('extra', function(comment) {
-    output.push(pad('  ' + format.yellow(comment.raw)) + '\n');
-  });
+loader.stdout.on('data', (data) => {
+  process.stdin.push(`${data}`);
+});
 
-  // All done
-  parser.on('complete', function(results) {
-    output.push('\n\n');
+loader.stderr.on('data', (data) => {
+  console.error(`${data}`);
+});
 
-    // Most likely a failure upstream
-    if(results.plan.end < 1) {
-      return markFailed();
-    }
+loader.on('close', (code) => {
+  process.exit(code);
+});
 
-    if(results.fail > 0) {
-      output.push(formatErrors(results));
-      output.push('\n');
-      markFailed();
-    }
-
-    output.push(formatTotals(results));
-    output.push('\n\n\n');
-
-    // Exit if no tests run. This is a result of 1 of 2 things:
-    //  1. No tests were written
-    //  2. There was some error before the TAP got to the parser
-    if(results.count === 0) {
-      markFailed();
-    }
-  });
-
-  // Utils
-
-  function markFailed() {
-    stream.failed = true;
-  }
-
-  function prettifyError(diag) {
-    return pad(`operator: ${diag.operator}\n`, 3) +
-      pad(`expected: ${diag.expected}\n`, 3) +
-      pad(`actual: ${diag.actual}\n`, 3) +
-      pad(`at: ${diag.at}\n\n`, 3);
-  }
-
-  function formatErrors(results) {
-    const failCount = results.fail;
-    const past = (failCount === 1) ? 'was' : 'were';
-    const plural = (failCount === 1) ? 'failure' : 'failures';
-
-    let out = '\n' + pad(format.red.bold('Failed Tests:') + ' There ' + past + ' ' + format.red.bold(failCount) + ' ' + plural + '\n');
-    out += formatFailedAssertions(results);
-
-    return out;
-  }
-
-  function formatTotals(results) {
-    if(results.count === 0) {
-      return pad(format.red(symbols.cross + ' No tests found'));
-    }
-
-    const end = process.hrtime(startTime);
-
-    return _.filter([
-      pad('total:     ' + results.count),
-      pad(format.green('passing:   ' + results.pass)),
-      results.fail > 0 ? pad(format.red('failing:   ' + results.fail)) : undefined,
-      pad(`duration: ${end.join('.')} sec`)
-    ], _.identity).join('\n');
-  }
-
-  function formatFailedAssertions(results) {
-    let out = '';
-
-    for(const test in errorSummary) {
-      const errors = errorSummary[test];
-      if(!errors.length) { continue; }
-
-      out += '\n' + pad('  ' + test + '\n\n');
-
-      _.each(errors, function(name) {
-        out += pad('    ' + format.red(symbols.cross) + ' ' + format.red(name)) + '\n';
-      });
-    }
-
-    return out;
-  }
-
-  function pad(str, times) {
-    if(!times) { times = 1; }
-
-    return _.fill(new Array(times), OUTPUT_PADDING).join('') + str;
-  }
-
-  return stream;
-};
+process.stdin
+  .pipe(duplexer(tapper, out))
+  .pipe(process.stdout);
